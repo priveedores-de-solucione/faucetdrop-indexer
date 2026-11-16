@@ -551,6 +551,10 @@ def detect_and_call(w3: Web3, address_checksum: str):
         return ("checkin", tx_count, [p.lower() for p in participants if p])
     except Exception:
         pass
+    # Factory whose getAllTransactions() has a different shape: still pick up its faucets
+    faucets = _get_all_faucets_from_factory(w3, address_checksum)
+    if faucets:
+        return ("factory", [], faucets)
     return ("unknown", None, None)
 
 
@@ -824,8 +828,13 @@ def set_last_block(key: str, block: int) -> None:
 
 
 def _select_all(table: str, columns: str = "*", eq: Optional[Dict[str, Any]] = None,
-                in_: Optional[tuple] = None, page: int = 1000) -> List[Dict]:
-    """Reads every row of a Supabase query (Supabase caps a single read at 1000 rows)."""
+                in_: Optional[tuple] = None, gte: Optional[tuple] = None,
+                order: Optional[tuple] = None, page: int = 1000) -> List[Dict]:
+    """
+    Reads EVERY row of a Supabase query. A plain .execute() only returns the
+    first 1000 rows, which silently truncated users, claims, visits, etc.
+    order = (column, desc_bool); gte = (column, value).
+    """
     rows: List[Dict] = []
     start = 0
     while True:
@@ -834,6 +843,10 @@ def _select_all(table: str, columns: str = "*", eq: Optional[Dict[str, Any]] = N
             q = q.eq(k, v)
         if in_:
             q = q.in_(in_[0], in_[1])
+        if gte:
+            q = q.gte(gte[0], gte[1])
+        if order:
+            q = q.order(order[0], desc=order[1])
         batch = q.range(start, start + page - 1).execute().data or []
         rows.extend(batch)
         if len(batch) < page:
@@ -938,6 +951,8 @@ def sync_claimS_events(
             all_events.extend(events)
         return all_events
 
+    scanned: list[dict] = []
+    db_ok = True
     for addr in addrs:
         key        = f"claimS:{chain_id}:{addr}"
         last       = get_last_block(key)
@@ -947,6 +962,7 @@ def sync_claimS_events(
 
         events, last_ok = fetch_claimS_events_for_faucet(w3, addr, from_block, to_block)
         rows = [{**ev, "chain_id": chain_id} for ev in events]
+        scanned.extend(rows)
         try:
             for chunk in _chunks(rows, 200):
                 supabase.table("claim_events").upsert(chunk, on_conflict="id").execute()
@@ -955,13 +971,19 @@ def sync_claimS_events(
             print(f"      ✅ {addr[:10]}...: +{len(rows)} new Claimed events "
                   f"(blocks {from_block}→{last_ok})")
         except Exception as e:
+            db_ok = False
             print(f"      ⚠️  {addr[:10]}...: saving claim_events failed — {e}")
 
-    try:
-        return _select_all("claim_events", "*", eq={"chain_id": chain_id}, in_=("faucet", addrs))
-    except Exception as e:
-        print(f"   ⚠️  reading claim_events failed: {e}")
-        return []
+    if db_ok:
+        try:
+            return _select_all("claim_events", "*", eq={"chain_id": chain_id}, in_=("faucet", addrs))
+        except Exception as e:
+            print(f"   ⚠️  reading claim_events failed: {e}")
+
+    # DB tables missing/broken → never drop data: use what was just scanned.
+    # (indexer_state also fails then, so the scan above started at the deploy block)
+    print(f"   ↩️  using {len(scanned)} freshly scanned Claimed events (DB unavailable)")
+    return scanned
 
 
 def _fetch_contract_events_chunked(
@@ -1061,6 +1083,7 @@ def fetch_quiz_ecosystem_chain_sync(chain_id: int, cfg: Dict) -> Dict:
     exclude_addrs = {c["address"].lower() for c in cfg["contracts"].values()}
 
     new_rows: List[Dict] = []
+    db_ok = True
 
     for contract_key, contract_cfg in cfg["contracts"].items():
         addr_cs = safe_checksum(w3, contract_cfg["address"])
@@ -1113,14 +1136,18 @@ def fetch_quiz_ecosystem_chain_sync(chain_id: int, cfg: Dict) -> Dict:
                 if last_ok >= from_block:
                     set_last_block(state_key, last_ok)
             except Exception as e:
+                db_ok = False
                 print(f"   ⚠️  {cfg['name']} / {contract_key}: saving events failed — {e}")
         new_rows.extend(rows)
 
-    # Full history: from the DB if available, otherwise just what we scanned now
-    if supabase:
-        transactions = _select_all("quiz_ecosystem_events", "*", eq={"chain_id": chain_id})
-    else:
-        transactions = new_rows
+    # Full history: from the DB if it works, otherwise what we just scanned
+    transactions = new_rows
+    if supabase and db_ok:
+        try:
+            transactions = _select_all("quiz_ecosystem_events", "*", eq={"chain_id": chain_id})
+        except Exception as e:
+            print(f"   ⚠️  {cfg['name']}: reading quiz_ecosystem_events failed — {e}")
+            transactions = new_rows
 
     user_addrs: set = set()
     user_tx_counts: Dict[str, int] = defaultdict(int)
@@ -1309,7 +1336,7 @@ async def collect_quest_quiz_unique_participants() -> set:
 
                 if supabase:
                     try:
-                        rows = supabase.table(sb_table).select(sb_col).execute().data or []
+                        rows = _select_all(sb_table, sb_col)
                         sb_addrs = {r[sb_col].lower() for r in rows if r.get(sb_col)
                                     and not is_placeholder_address(r[sb_col])}
                         new_from_sb = sb_addrs - item_addresses
@@ -1347,7 +1374,7 @@ async def collect_quest_quiz_unique_participants() -> set:
 
         # Quest participants from DB
         try:
-            rows = supabase.table("quest_participants").select("wallet_address").execute().data or []
+            rows = _select_all("quest_participants", "wallet_address")
             added = {r["wallet_address"].lower() for r in rows if r.get("wallet_address")}
             db_participants.update(added)
             print(f"   📦 [DB] quest_participants: {len(added)} wallet addresses")
@@ -1356,7 +1383,7 @@ async def collect_quest_quiz_unique_participants() -> set:
 
         # Quiz participants from DB
         try:
-            rows = supabase.table("faucet_quiz_participants").select("wallet_address").execute().data or []
+            rows = _select_all("faucet_quiz_participants", "wallet_address")
             added = {r["wallet_address"].lower() for r in rows if r.get("wallet_address")}
             db_participants.update(added)
             print(f"   📦 [DB] faucet_quiz_participants: {len(added)} wallet addresses")
@@ -1507,9 +1534,7 @@ def _fetch_quest_quiz_participant_dates() -> dict:
 
     # Quest participants
     try:
-        rows = supabase.table("quest_participants")\
-            .select("wallet_address, created_at")\
-            .execute().data or []
+        rows = _select_all("quest_participants", "wallet_address, created_at")
         for r in rows:
             addr = (r.get("wallet_address") or "").lower()
             ts   = r.get("created_at")
@@ -1528,9 +1553,7 @@ def _fetch_quest_quiz_participant_dates() -> dict:
 
     # Quiz participants
     try:
-        rows = supabase.table("faucet_quiz_participants")\
-            .select("wallet_address, created_at")\
-            .execute().data or []
+        rows = _select_all("faucet_quiz_participants", "wallet_address, created_at")
         for r in rows:
             addr = (r.get("wallet_address") or "").lower()
             ts   = r.get("created_at")
@@ -2055,17 +2078,15 @@ async def get_all_quests_for_dashboard():
     if not supabase:
         raise HTTPException(status_code=503, detail="Database not available")
     try:
-        quest_rows = supabase.table("quests").select("*").execute().data or []
+        quest_rows = _select_all("quests", "*")
 
-        p_rows = supabase.table("quest_participants")\
-            .select("quest_address, wallet_address").execute().data or []
+        p_rows = _select_all("quest_participants", "quest_address, wallet_address")
         participant_counts: dict = {}
         for p in p_rows:
             addr = p["quest_address"]
             participant_counts[addr] = participant_counts.get(addr, 0) + 1
 
-        t_rows = supabase.table("faucet_tasks")\
-            .select("faucet_address, tasks").execute().data or []
+        t_rows = _select_all("faucet_tasks", "faucet_address, tasks")
         task_counts: dict = {
             r["faucet_address"]: len(r.get("tasks") or [])
             for r in t_rows
@@ -2097,30 +2118,25 @@ async def get_all_quizzes_for_dashboard():
     if not supabase:
         raise HTTPException(status_code=503, detail="Database not available")
     try:
-        quiz_rows = supabase.table("faucet_quizzes").select(
-            "id, code, title, status, chain_id, created_at"
-        ).execute().data or []
+        quiz_rows = _select_all("faucet_quizzes", "id, code, title, status, chain_id, created_at")
 
         quiz_ids = [q["id"] for q in quiz_rows]
         if not quiz_ids:
             return {"success": True, "quizzes": [], "count": 0}
 
-        p_rows = supabase.table("faucet_quiz_participants")\
-            .select("quiz_id").execute().data or []
+        p_rows = _select_all("faucet_quiz_participants", "quiz_id")
         player_counts: dict = {}
         for p in p_rows:
             qid = p["quiz_id"]
             player_counts[qid] = player_counts.get(qid, 0) + 1
 
-        q_rows = supabase.table("faucet_quiz_questions")\
-            .select("quiz_id").execute().data or []
+        q_rows = _select_all("faucet_quiz_questions", "quiz_id")
         question_counts: dict = {}
         for q in q_rows:
             qid = q["quiz_id"]
             question_counts[qid] = question_counts.get(qid, 0) + 1
 
-        r_rows = supabase.table("faucet_quiz_rewards")\
-            .select("quiz_id, pool_amount, token_symbol").execute().data or []
+        r_rows = _select_all("faucet_quiz_rewards", "quiz_id, pool_amount, token_symbol")
         reward_map: dict = {
             r["quiz_id"]: {
                 "poolAmount":  float(r.get("pool_amount") or 0),
@@ -2155,11 +2171,11 @@ def load_from_supabase() -> Optional[dict]:
     meta_rows = supabase.table("dashboard_meta").select("*").eq("id", 1).execute().data
     meta = meta_rows[0] if meta_rows else {}
 
-    faucet_rows = supabase.table("faucet_data").select("*").execute().data or []
+    faucet_rows = _select_all("faucet_data", "*")
     network_faucets = [{"network": r["network"], "faucets": r["faucets"]} for r in faucet_rows]
     total_faucets   = meta.get("total_faucets") or sum(r["faucets"] for r in network_faucets)
 
-    user_rows = supabase.table("user_data").select("*").order("date", desc=False).execute().data or []
+    user_rows = _select_all("user_data", "*", order=("date", False))
     users_chart        = [
         {
             "date":            r["date"],
@@ -2171,7 +2187,7 @@ def load_from_supabase() -> Optional[dict]:
     ]
     total_unique_users = meta.get("total_unique_users") or (user_rows[-1]["cumulative_users"] if user_rows else 0)
 
-    claim_rows = supabase.table("claim_data").select("*").order("latest_claim_time", desc=True).execute().data or []
+    claim_rows = _select_all("claim_data", "*", order=("latest_claim_time", True))
     if not claim_rows and not meta:
         return None
 
@@ -2191,7 +2207,7 @@ def load_from_supabase() -> Optional[dict]:
         for i, r in enumerate(claim_rows)
     ]
 
-    net_tx_rows = supabase.table("network_tx_data").select("*").execute().data or []
+    net_tx_rows = _select_all("network_tx_data", "*")
     if net_tx_rows:
         network_transactions = [
             {
@@ -2266,7 +2282,7 @@ async def build_faucet_analytics() -> dict:
         meta = meta_rows[0] if meta_rows else {}
 
         # Faucet rows from network_faucets — filter out deleted
-        all_faucet_rows = supabase.table("network_faucets").select("*").execute().data or []
+        all_faucet_rows = _select_all("network_faucets", "*")
         faucet_rows = [
             f for f in all_faucet_rows
             if f.get("faucet_address", "").lower() not in deleted_set
@@ -2281,7 +2297,7 @@ async def build_faucet_analytics() -> dict:
 
         # Monthly volume: aggregate claim_data by month + factory_type
         # Filter claim_data to exclude deleted faucets
-        claim_rows_raw = supabase.table("claim_data").select("*").execute().data or []
+        claim_rows_raw = _select_all("claim_data", "*")
         claim_rows = [
             r for r in claim_rows_raw
             if r.get("faucet_address", "").lower() not in deleted_set
@@ -2387,18 +2403,18 @@ async def build_quest_analytics() -> dict:
     Tables used: quests, quest_participants, faucet_tasks, submissions
     """
     try:
-        quest_rows = supabase.table("quests").select("*").execute().data or []
+        quest_rows = _select_all("quests", "*")
 
         active_quests = sum(1 for q in quest_rows if q.get("is_active") and not q.get("is_draft"))
         total_quests  = len([q for q in quest_rows if not q.get("is_draft")])
 
-        participant_rows = supabase.table("quest_participants").select("wallet_address, quest_address, points, updated_at").execute().data or []
+        participant_rows = _select_all("quest_participants", "wallet_address, quest_address, points, updated_at")
         unique_participants = len({r["wallet_address"] for r in participant_rows})
 
-        submission_rows = supabase.table("submissions").select("faucet_address, wallet_address, status, submitted_at").execute().data or []
+        submission_rows = _select_all("submissions", "faucet_address, wallet_address, status, submitted_at")
         completions = sum(1 for s in submission_rows if s.get("status") == "approved")
 
-        task_rows = supabase.table("faucet_tasks").select("faucet_address, tasks").execute().data or []
+        task_rows = _select_all("faucet_tasks", "faucet_address, tasks")
         task_count_map = {r["faucet_address"]: len(r.get("tasks") or []) for r in task_rows}
         avg_tasks = round(
             sum(task_count_map.values()) / len(task_count_map), 1
@@ -2486,24 +2502,27 @@ async def build_quest_analytics() -> dict:
 
 async def build_quiz_analytics() -> dict:
     try:
-        quiz_rows = supabase.table("faucet_quizzes").select(
+        quiz_rows = _select_all(
+            "faucet_quizzes",
             "id, code, title, status, chain_id, faucet_address, creator_address, "
             "is_ai_generated, max_participants, time_per_question, created_at, "
-            "rewards_distributed"
-        ).execute().data or []
+            "rewards_distributed",
+        )
 
         total_quizzes = len(quiz_rows)
         quiz_id_map   = {q["id"]: q for q in quiz_rows}
 
-        participant_rows = supabase.table("faucet_quiz_participants").select(
-            "quiz_id, wallet_address, final_rank, final_points, points"
-        ).execute().data or []
+        participant_rows = _select_all(
+            "faucet_quiz_participants",
+            "quiz_id, wallet_address, final_rank, final_points, points",
+        )
 
         total_attempts = len(participant_rows)
 
-        answer_rows = supabase.table("faucet_quiz_answers").select(
-            "quiz_id, wallet_address, is_correct, points_earned, answered_at"
-        ).execute().data or []
+        answer_rows = _select_all(
+            "faucet_quiz_answers",
+            "quiz_id, wallet_address, is_correct, points_earned, answered_at",
+        )
 
         from collections import defaultdict
         answer_map: dict = defaultdict(lambda: {"correct": 0, "total": 0})
@@ -2670,12 +2689,12 @@ async def get_network_faucets(
         # Fetch deleted set and filter them out of results
         deleted_set = await fetch_deleted_faucets()
 
-        q = supabase.table("network_faucets").select("*").eq("chain_id", chain_id)
+        filters: Dict[str, Any] = {"chain_id": chain_id}
         if active_only:
-            q = q.eq("is_claim_active", True)
+            filters["is_claim_active"] = True
         if factory_type:
-            q = q.eq("factory_type", factory_type)
-        rows = q.order("start_time", desc=True).execute().data or []
+            filters["factory_type"] = factory_type
+        rows = _select_all("network_faucets", "*", eq=filters, order=("start_time", True))
 
         # Filter deleted
         rows = [r for r in rows if r.get("faucet_address", "").lower() not in deleted_set]
@@ -2798,12 +2817,12 @@ async def get_all_faucets(
         # Filter deleted faucets from listing
         deleted_set = await fetch_deleted_faucets()
 
-        q = supabase.table("network_faucets").select("*")
+        filters: Dict[str, Any] = {}
         if active_only:
-            q = q.eq("is_claim_active", True)
+            filters["is_claim_active"] = True
         if factory_type:
-            q = q.eq("factory_type", factory_type)
-        rows = q.order("start_time", desc=True).execute().data or []
+            filters["factory_type"] = factory_type
+        rows = _select_all("network_faucets", "*", eq=filters, order=("start_time", True))
 
         # Filter deleted
         rows = [r for r in rows if r.get("faucet_address", "").lower() not in deleted_set]
@@ -3335,13 +3354,9 @@ async def get_visit_stats(days: int = 30):
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
     try:
-        rows = (
-            supabase.table("page_visits")
-            .select("path, fingerprint, visited_at")
-            .gte("visited_at", since)
-            .order("visited_at", desc=False)
-            .execute()
-            .data or []
+        rows = _select_all(
+            "page_visits", "path, fingerprint, visited_at",
+            gte=("visited_at", since), order=("visited_at", False),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -3424,11 +3439,11 @@ async def refresh_claims_cache():
         faucet_meta_map = {}
         if supabase:
             try:
-                resp = supabase.table("faucet_details").select(
-                    "faucet_address, faucet_name, token_symbol, token_decimals, slug"
-                ).execute()
-                if resp.data:
-                    for row in resp.data:
+                meta_rows = _select_all(
+                    "faucet_details", "faucet_address, faucet_name, token_symbol, token_decimals, slug"
+                )
+                if meta_rows:
+                    for row in meta_rows:
                         addr = row["faucet_address"].lower()
                         if addr not in deleted_set:
                             faucet_meta_map[addr] = {
