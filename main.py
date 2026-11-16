@@ -207,7 +207,7 @@ CHAIN_CONFIGS: Dict[int, Dict] = {
     },
     1135: {
         "name": "Lisk",
-        "rpcUrls": ["https://rpc.api.lisk.com"],
+        "rpcUrls": ["https://rpc.api.lisk.com", "https://lisk.drpc.org"],
         "factoryAddresses": ["0x96E9911df17e94F7048cCbF7eccc8D9b5eDeCb5C", "0x4F5Cf906b9b2Bf4245dba9F7d2d7F086a2a441C2", "0x21E855A5f0E6cF8d0CfE8780eb18e818950dafb7", "0xd6Cb67dF496fF739c4eBA2448C1B0B44F4Cf0a7C", "0x0837EACf85472891F350cba74937cB02D90E60A4"],
         "Quests": ["0xE9a7637f11F22c55061936Bc97b9aFEAC2e93C2E","0xc7889C58B51574d32C83b2e2F60d5eC145103Eb3"],
         "quiz":   ["0x8BD9AD5C66Ca2BE1A728e4d139d92103615bcA7C","0x6D0d7DD8b5E80BfeCa9060703c3768440467D12e"],
@@ -792,7 +792,63 @@ def save_dashboard_to_supabase(data: Dict[str, Any], deleted_addrs: Optional[set
     except Exception as e:
         print(f"⚠️  [save_dashboard_to_supabase] failed: {e}")
 
+# ====================== INDEXER STATE (incremental scanning) ======================
+# Remembers the last block scanned per contract so each run only reads new blocks.
+#
+#   create table if not exists indexer_state (
+#     key text primary key, last_block bigint not null, updated_at timestamptz default now()
+#   );
+
+def get_last_block(key: str) -> Optional[int]:
+    if not supabase:
+        return None
+    try:
+        rows = supabase.table("indexer_state").select("last_block").eq("key", key).execute().data
+        return int(rows[0]["last_block"]) if rows else None
+    except Exception as e:
+        print(f"   ⚠️  [indexer_state] read {key} failed: {e}")
+        return None
+
+
+def set_last_block(key: str, block: int) -> None:
+    if not supabase:
+        return
+    try:
+        supabase.table("indexer_state").upsert({
+            "key":        key,
+            "last_block": int(block),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="key").execute()
+    except Exception as e:
+        print(f"   ⚠️  [indexer_state] write {key} failed: {e}")
+
+
+def _select_all(table: str, columns: str = "*", eq: Optional[Dict[str, Any]] = None,
+                in_: Optional[tuple] = None, page: int = 1000) -> List[Dict]:
+    """Reads every row of a Supabase query (Supabase caps a single read at 1000 rows)."""
+    rows: List[Dict] = []
+    start = 0
+    while True:
+        q = supabase.table(table).select(columns)
+        for k, v in (eq or {}).items():
+            q = q.eq(k, v)
+        if in_:
+            q = q.in_(in_[0], in_[1])
+        batch = q.range(start, start + page - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
+    return rows
+
+
 # ====================== CLAIMSS EVENT FETCHER ======================
+#
+#   create table if not exists claim_events (
+#     id text primary key, chain_id int, faucet text, claimer text, amount text,
+#     is_ether boolean, time bigint, tx_hash text, block_number bigint
+#   );
+#   create index if not exists claim_events_faucet_idx on claim_events (chain_id, faucet);
 
 from eth_utils import keccak
 CLAIMED_TOPIC = "0x" + keccak(text="Claimed(address,uint256,bool)").hex()
@@ -802,17 +858,18 @@ def fetch_claimS_events_for_faucet(
     faucet_addr: str,
     from_block: int,
     to_block: int,
-) -> list[dict]:
+) -> tuple[list[dict], int]:
     """
     Reads Claimed(address,uint256,bool) logs directly from a custom faucet.
-    Used for claimS() calls which don't recordTransaction on the factory.
+    Returns (events, last_ok_block). Stops at the first failed chunk so the
+    next run retries from there instead of silently skipping blocks.
     """
     results = []
     faucet_cs = safe_checksum(w3, faucet_addr)
     if not faucet_cs:
-        return results
+        return results, to_block
 
-    # Botchain may have RPC limits — chunk into 10k block ranges
+    contract = w3.eth.contract(address=faucet_cs, abi=FAUCET_ABI)
     CHUNK = 10_000
     current = from_block
     while current <= to_block:
@@ -824,28 +881,88 @@ def fetch_claimS_events_for_faucet(
                 "address":   faucet_cs,
                 "topics":    [CLAIMED_TOPIC],
             })
-            for log in logs:
-                try:
-                    contract = w3.eth.contract(address=faucet_cs, abi=FAUCET_ABI)
-                    decoded  = contract.events.Claimed().process_log(log)
-                    args     = decoded["args"]
-                    block    = w3.eth.get_block(log["blockNumber"])
-                    results.append({
-                        "faucet":       faucet_addr.lower(),
-                        "claimer":      args["user"].lower(),
-                        "amount":       str(args["amount"]),
-                        "is_ether":     args["isEther"],
-                        "time":         int(block["timestamp"]),
-                        "tx_hash":      log["transactionHash"].hex(),
-                        "block_number": log["blockNumber"],
-                    })
-                except Exception as e:
-                    print(f"      ⚠️  decode Claimed log {faucet_cs[:10]}... block {log.get('blockNumber')}: {e}")
         except Exception as e:
             print(f"   ⚠️  get_logs {faucet_cs[:10]}... blocks {current}-{end}: {e}")
+            return results, current - 1
+
+        for log in logs:
+            try:
+                decoded = contract.events.Claimed().process_log(log)
+                args    = decoded["args"]
+                tx_hash = log["transactionHash"].hex()
+                results.append({
+                    "id":           f"{tx_hash}:{log['logIndex']}",
+                    "faucet":       faucet_addr.lower(),
+                    "claimer":      args["user"].lower(),
+                    "amount":       str(args["amount"]),
+                    "is_ether":     bool(args["isEther"]),
+                    "time":         int(w3.eth.get_block(log["blockNumber"])["timestamp"]),
+                    "tx_hash":      tx_hash,
+                    "block_number": log["blockNumber"],
+                })
+            except Exception as e:
+                print(f"      ⚠️  decode Claimed log {faucet_cs[:10]}... block {log.get('blockNumber')}: {e}")
         current = end + 1
 
-    return results
+    return results, to_block
+
+
+def sync_claimS_events(
+    w3: Web3,
+    chain_id: int,
+    faucet_addresses: list[str],
+    deploy_block: int,
+    deleted: set,
+) -> list[dict]:
+    """
+    Incrementally indexes Claimed events for the given faucets:
+      1. scans only blocks after the last saved block (per faucet)
+      2. stores new events in claim_events
+      3. returns ALL stored events for those faucets
+    Without Supabase it falls back to a full scan held in memory.
+    """
+    addrs = [a.lower() for a in faucet_addresses if a and a.lower() not in deleted]
+    if not addrs:
+        return []
+
+    try:
+        to_block = w3.eth.block_number
+    except Exception as e:
+        print(f"   ⚠️  Could not get latest block: {e}")
+        return []
+
+    if not supabase:
+        all_events = []
+        for addr in addrs:
+            events, _ = fetch_claimS_events_for_faucet(w3, addr, deploy_block, to_block)
+            all_events.extend(events)
+        return all_events
+
+    for addr in addrs:
+        key        = f"claimS:{chain_id}:{addr}"
+        last       = get_last_block(key)
+        from_block = (last + 1) if last is not None else deploy_block
+        if from_block > to_block:
+            continue
+
+        events, last_ok = fetch_claimS_events_for_faucet(w3, addr, from_block, to_block)
+        rows = [{**ev, "chain_id": chain_id} for ev in events]
+        try:
+            for chunk in _chunks(rows, 200):
+                supabase.table("claim_events").upsert(chunk, on_conflict="id").execute()
+            if last_ok >= from_block:
+                set_last_block(key, last_ok)
+            print(f"      ✅ {addr[:10]}...: +{len(rows)} new Claimed events "
+                  f"(blocks {from_block}→{last_ok})")
+        except Exception as e:
+            print(f"      ⚠️  {addr[:10]}...: saving claim_events failed — {e}")
+
+    try:
+        return _select_all("claim_events", "*", eq={"chain_id": chain_id}, in_=("faucet", addrs))
+    except Exception as e:
+        print(f"   ⚠️  reading claim_events failed: {e}")
+        return []
+
 
 def _fetch_contract_events_chunked(
     w3: Web3,
@@ -854,22 +971,27 @@ def _fetch_contract_events_chunked(
     from_block: int,
     to_block: int,
     chunk_size: int = 10_000,
-) -> list[tuple[str, Any]]:
-    """Fetches multiple named events off one contract across a block range, chunked."""
+) -> tuple[list[tuple[str, Any]], int]:
+    """
+    Fetches multiple named events off one contract across a block range, chunked.
+    Returns (logs, last_ok_block) — stops at the first failed chunk.
+    """
     results = []
     current = from_block
     while current <= to_block:
         end = min(current + chunk_size - 1, to_block)
+        chunk_logs = []
         for ev_name in event_names:
             try:
                 event = getattr(contract.events, ev_name)
-                logs = event().get_logs(from_block=current, to_block=end)
-                for log in logs:
-                    results.append((ev_name, log))
+                for log in event().get_logs(from_block=current, to_block=end):
+                    chunk_logs.append((ev_name, log))
             except Exception as e:
                 print(f"      ⚠️  get_logs {contract.address[:10]}... {ev_name} blocks {current}-{end}: {e}")
+                return results, current - 1
+        results.extend(chunk_logs)
         current = end + 1
-    return results
+    return results, to_block
 
 
 def _preload_block_timestamps(w3: Web3, chain_id: int, logs: list[tuple[str, Any]]):
@@ -908,18 +1030,37 @@ def _is_real_user_address(addr: Optional[str], exclude: set) -> bool:
     return a != ZERO_ADDRESS and a not in exclude
 
 
-def fetch_quiz_ecosystem_chain_sync(chain_id: int, cfg: Dict) -> Dict:
-    """Fetches drop_token/quiz_hub/redeem_pool events for one chain and merges unique users."""
-    w3 = get_web3_for_chain(cfg["rpcUrls"], chain_id)
+# ====================== QUIZ ECOSYSTEM EVENTS (incremental) ======================
+#
+#   create table if not exists quiz_ecosystem_events (
+#     id text primary key, chain_id int, network text, contract text,
+#     contract_address text, event text, users text[], args jsonb,
+#     tx_hash text, block_number bigint, time bigint
+#   );
+#   create index if not exists qe_events_chain_idx on quiz_ecosystem_events (chain_id);
 
+def _json_safe(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        # Postgres jsonb handles big numbers, but JS clients don't — keep huge ints as strings
+        return v if abs(v) < 2**53 else str(v)
+    return str(v)
+
+
+def fetch_quiz_ecosystem_chain_sync(chain_id: int, cfg: Dict) -> Dict:
+    """
+    Indexes drop_token/quiz_hub/redeem_pool events for one chain.
+    Only blocks after the last saved block are scanned; new events go to
+    quiz_ecosystem_events and the full history is read back from there.
+    """
+    w3 = get_web3_for_chain(cfg["rpcUrls"], chain_id)
     to_block = w3.eth.block_number
 
     # Never treat the contracts themselves as "users" if they show up as an event arg
     exclude_addrs = {c["address"].lower() for c in cfg["contracts"].values()}
 
-    transactions: List[Dict] = []
-    user_addrs: set = set()
-    user_tx_counts: Dict[str, int] = defaultdict(int)
+    new_rows: List[Dict] = []
 
     for contract_key, contract_cfg in cfg["contracts"].items():
         addr_cs = safe_checksum(w3, contract_cfg["address"])
@@ -927,46 +1068,73 @@ def fetch_quiz_ecosystem_chain_sync(chain_id: int, cfg: Dict) -> Dict:
             print(f"   ⚠️  {cfg['name']} / {contract_key}: invalid address {contract_cfg['address']}")
             continue
 
-        contract = w3.eth.contract(address=addr_cs, abi=contract_cfg["abi"])
-        event_names = ALL_EVENTS_BY_CONTRACT.get(contract_key, [])
+        state_key   = f"qe:{chain_id}:{contract_key}:{contract_cfg['address'].lower()}"
+        deploy      = contract_cfg.get("deploy_block", 0)
+        last        = get_last_block(state_key)
+        from_block  = (last + 1) if last is not None else deploy
+        if from_block > to_block:
+            continue
+
+        contract     = w3.eth.contract(address=addr_cs, abi=contract_cfg["abi"])
+        event_names  = ALL_EVENTS_BY_CONTRACT.get(contract_key, [])
         user_arg_map = USER_EVENTS_BY_CONTRACT.get(contract_key, {})
-        from_block = contract_cfg.get("deploy_block", 0)
 
-        logs = _fetch_contract_events_chunked(w3, contract, event_names, from_block, to_block)
-        _preload_block_timestamps(w3, chain_id, logs)  # ← add this
+        logs, last_ok = _fetch_contract_events_chunked(w3, contract, event_names, from_block, to_block)
+        _preload_block_timestamps(w3, chain_id, logs)
+        print(f"   🔍 {cfg['name']} / {contract_key}: +{len(logs)} new events (blocks {from_block}→{last_ok})")
 
-        print(f"   🔍 {cfg['name']} / {contract_key}: {len(logs)} events (blocks {from_block}→{to_block})")
-
+        rows = []
         for ev_name, log in logs:
             args = dict(log["args"])
-            ts = _get_block_timestamp_cached(w3, chain_id, log["blockNumber"])
-
-            involved_users = []
+            involved = []
             for arg_name in user_arg_map.get(ev_name, []):
                 val = args.get(arg_name)
                 if _is_real_user_address(val, exclude_addrs):
-                    lowered = str(val).lower()
-                    involved_users.append(lowered)
-                    user_addrs.add(lowered)
-                    user_tx_counts[lowered] += 1
-
-            transactions.append({
-                "chain_id":          chain_id,
-                "network":           cfg["name"],
-                "contract":          contract_key,
-                "contract_address":  contract_cfg["address"].lower(),
-                "event":             ev_name,
-                "users":             involved_users,
-                "args":              {k: (v if isinstance(v, (int, bool)) else str(v)) for k, v in args.items()},
-                "tx_hash":           log["transactionHash"].hex(),
-                "block_number":      log["blockNumber"],
-                "time":              ts,
+                    involved.append(str(val).lower())
+            tx_hash = log["transactionHash"].hex()
+            rows.append({
+                "id":               f"{tx_hash}:{log['logIndex']}",
+                "chain_id":         chain_id,
+                "network":          cfg["name"],
+                "contract":         contract_key,
+                "contract_address": contract_cfg["address"].lower(),
+                "event":            ev_name,
+                "users":            involved,
+                "args":             {k: _json_safe(v) for k, v in args.items()},
+                "tx_hash":          tx_hash,
+                "block_number":     log["blockNumber"],
+                "time":             _get_block_timestamp_cached(w3, chain_id, log["blockNumber"]),
             })
 
+        if supabase:
+            try:
+                for chunk in _chunks(rows, 200):
+                    supabase.table("quiz_ecosystem_events").upsert(chunk, on_conflict="id").execute()
+                if last_ok >= from_block:
+                    set_last_block(state_key, last_ok)
+            except Exception as e:
+                print(f"   ⚠️  {cfg['name']} / {contract_key}: saving events failed — {e}")
+        new_rows.extend(rows)
+
+    # Full history: from the DB if available, otherwise just what we scanned now
+    if supabase:
+        transactions = _select_all("quiz_ecosystem_events", "*", eq={"chain_id": chain_id})
+    else:
+        transactions = new_rows
+
+    user_addrs: set = set()
+    user_tx_counts: Dict[str, int] = defaultdict(int)
+    for tx in transactions:
+        tx["users"] = tx.get("users") or []
+        tx["time"]  = int(tx.get("time") or 0)
+        for u in tx["users"]:
+            user_addrs.add(u)
+            user_tx_counts[u] += 1
+
     return {
-        "transactions": transactions,
-        "users": user_addrs,
-        "user_tx_counts": dict(user_tx_counts),
+        "transactions":     transactions,
+        "users":            user_addrs,
+        "user_tx_counts":   dict(user_tx_counts),
         "scanned_to_block": to_block,
     }
 
@@ -1022,35 +1190,6 @@ async def refresh_quiz_ecosystem_cache():
               f"{len(QUIZ_ECOSYSTEM_CONFIGS)} chains")
     except Exception as e:
         print(f"⚠️ [refresh_quiz_ecosystem_cache] Failed: {e}")
-
-
-def fetch_all_claimS_events(
-    w3: Web3,
-    faucet_addresses: list[str],
-    from_block: int,
-    deleted: set,
-) -> list[dict]:
-    """Fetches Claimed events across all given custom faucet addresses."""
-    all_events = []
-    try:
-        to_block = w3.eth.block_number
-    except Exception as e:
-        print(f"   ⚠️  Could not get latest block: {e}")
-        return all_events
-
-    print(f"   🔍 [Botchain] querying Claimed events on "
-          f"{len(faucet_addresses)} custom faucets "
-          f"(blocks {from_block}→{to_block})...")
-
-    for addr in faucet_addresses:
-        if addr.lower() in deleted:
-            continue
-        events = fetch_claimS_events_for_faucet(w3, addr, from_block, to_block)
-        if events:
-            print(f"      ✅ {addr[:10]}...: {len(events)} Claimed events")
-        all_events.extend(events)
-
-    return all_events
 
 
 # ====================== CUSTOM FACTORY HELPERS ======================
@@ -1662,8 +1801,8 @@ async def refresh_all_data():
                 if custom_faucet_list:
                     claimS_events = await loop.run_in_executor(
                         None,
-                        lambda addrs=custom_faucet_list: fetch_all_claimS_events(
-                            w3,
+                        lambda addrs=custom_faucet_list: sync_claimS_events(
+                            w3, 677,
                             [str(a) for a in addrs],
                             BOTCHAIN_CUSTOM_FACTORY_DEPLOY_BLOCK,
                             deleted,
@@ -1695,11 +1834,11 @@ async def refresh_all_data():
                             }
                         faucet_stats[addr_lower]["claims"] += 1
                         faucet_stats[addr_lower]["latest"] = max(
-                            faucet_stats[addr_lower]["latest"], ev["time"]
+                            faucet_stats[addr_lower]["latest"], int(ev["time"])
                         )
                         all_claims.append((
                             ev["faucet"], "claim", ev["claimer"],
-                            ev["amount"], ev["is_ether"], ev["time"],
+                            ev["amount"], ev["is_ether"], int(ev["time"]),
                         ))
 
         all_txs_count += chain_tx_count
@@ -2494,9 +2633,9 @@ async def get_analytics(background_tasks: BackgroundTasks):
     )
 
     if cache_stale and not _analytics_cache:
-        await refresh_analytics_cache()
+        await job_analytics()
     elif cache_stale:
-        background_tasks.add_task(refresh_analytics_cache)
+        background_tasks.add_task(job_analytics)
 
     return _analytics_cache
 
@@ -2690,9 +2829,9 @@ async def refresh_network_endpoint(chain_id: int, background_tasks: BackgroundTa
 @app.get("/api/refresh")
 async def manual_refresh():
     print("🖱️  [manual_refresh] triggered by frontend")
-    await job_all_data()
+    ran = await job_all_data()
     return {
-        "status":       "complete",
+        "status":       "complete" if ran else "already_running",
         "last_updated": dashboard_data.get("last_updated"),
     }
 
@@ -3359,33 +3498,30 @@ async def refresh_claims_cache():
                         if r.get("faucet_address", "").lower() not in deleted_set
                     ]
                     if custom_addrs:
-                        to_block = w3.eth.block_number
-                        print(f"   🔍 [refresh_claims_cache] Botchain: fetching claimS events "
+                        print(f"   🔍 [refresh_claims_cache] Botchain: syncing claimS events "
                               f"for {len(custom_addrs)} custom faucets...")
-                        for addr in custom_addrs:
-                            events = fetch_claimS_events_for_faucet(
-                                w3, addr,
-                                BOTCHAIN_CUSTOM_FACTORY_DEPLOY_BLOCK,
-                                to_block,
-                            )
-                            if events:
-                                print(f"      ✅ {addr[:10]}...: {len(events)} claimS events")
+                        events_all = sync_claimS_events(
+                            w3, 677, custom_addrs,
+                            BOTCHAIN_CUSTOM_FACTORY_DEPLOY_BLOCK,
+                            deleted_set,
+                        )
+                        for ev in events_all:
+                            addr = ev["faucet"]
                             meta = faucet_meta_map.get(addr.lower(), {})
-                            for ev in events:
-                                fetched.append({
-                                    "faucet":           ev["faucet"],
-                                    "faucet_name":      meta.get("name", f"Faucet {addr[:6]}"),
-                                    "slug":             meta.get("slug"),
-                                    "claimer":          ev["claimer"],
-                                    "amount":           ev["amount"],
-                                    "token_symbol":     meta.get("symbol", "BOT"),
-                                    "token_decimals":   meta.get("decimals", 18),
-                                    "is_ether":         ev["is_ether"],
-                                    "time":             ev["time"],
-                                    "network":          "Botchain",
-                                    "chain_id":         677,
-                                    "transaction_type": "claim",
-                                })
+                            fetched.append({
+                                "faucet":           ev["faucet"],
+                                "faucet_name":      meta.get("name", f"Faucet {addr[:6]}"),
+                                "slug":             meta.get("slug"),
+                                "claimer":          ev["claimer"],
+                                "amount":           ev["amount"],
+                                "token_symbol":     meta.get("symbol", "BOT"),
+                                "token_decimals":   meta.get("decimals", 18),
+                                "is_ether":         ev["is_ether"],
+                                "time":             int(ev["time"]),
+                                "network":          "Botchain",
+                                "chain_id":         677,
+                                "transaction_type": "claim",
+                            })
                 except Exception as e:
                     print(f"   ⚠️  [refresh_claims_cache] Botchain claimS fetch failed: {e}")
 
@@ -3416,12 +3552,11 @@ async def get_all_claims(
         or (datetime.utcnow() - claims_last_updated).total_seconds() > CACHE_TTL_SECONDS
     )
 
-    if cache_stale:
+    if cache_stale and not is_job_running(refresh_claims_cache):
         if not global_claims_cache:
-            await refresh_claims_cache()
-        else:
-            if background_tasks:
-                background_tasks.add_task(refresh_claims_cache)
+            await job_claims()
+        elif background_tasks:
+            background_tasks.add_task(job_claims)
 
     return {
         "success": True,
@@ -3489,11 +3624,11 @@ async def get_quiz_ecosystem_users(
         not quiz_ecosystem_cache["last_updated"]
         or (datetime.utcnow() - quiz_ecosystem_cache["last_updated"]).total_seconds() > CACHE_TTL_SECONDS
     )
-    if stale:
+    if stale and not is_job_running(refresh_quiz_ecosystem_cache):
         if not quiz_ecosystem_cache["transactions"]:
-            await refresh_quiz_ecosystem_cache()
+            await job_quiz_ecosystem()
         elif background_tasks:
-            background_tasks.add_task(refresh_quiz_ecosystem_cache)
+            background_tasks.add_task(job_quiz_ecosystem)
 
     if chain_id is not None:
         chain_tx_counts: Dict[str, int] = defaultdict(int)
@@ -3548,11 +3683,11 @@ async def get_quiz_ecosystem_transactions(
         not quiz_ecosystem_cache["last_updated"]
         or (datetime.utcnow() - quiz_ecosystem_cache["last_updated"]).total_seconds() > CACHE_TTL_SECONDS
     )
-    if stale:
+    if stale and not is_job_running(refresh_quiz_ecosystem_cache):
         if not quiz_ecosystem_cache["transactions"]:
-            await refresh_quiz_ecosystem_cache()
+            await job_quiz_ecosystem()
         elif background_tasks:
-            background_tasks.add_task(refresh_quiz_ecosystem_cache)
+            background_tasks.add_task(job_quiz_ecosystem)
 
     txs = quiz_ecosystem_cache["transactions"]
     if chain_id is not None:
@@ -3658,14 +3793,29 @@ async def like_blog_post(slug: str, fingerprint: str):
 # The jobs make blocking web3 calls. Running them in a worker thread (with its
 # own event loop) keeps the API responsive while indexing.
 
-async def _run_in_thread(job):
-    await asyncio.to_thread(asyncio.run, job())
+import threading
+_job_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
 
-async def job_all_data():          await _run_in_thread(refresh_all_data)
-async def job_analytics():         await _run_in_thread(refresh_analytics_cache)
-async def job_claims():            await _run_in_thread(refresh_claims_cache)
-async def job_network_faucets():   await _run_in_thread(refresh_network_faucets)
-async def job_quiz_ecosystem():    await _run_in_thread(refresh_quiz_ecosystem_cache)
+def is_job_running(job) -> bool:
+    return _job_locks[job.__name__].locked()
+
+async def _run_in_thread(job) -> bool:
+    """Runs a job in a worker thread. Only one copy of each job runs at a time."""
+    lock = _job_locks[job.__name__]
+    if not lock.acquire(blocking=False):
+        print(f"⏭️  {job.__name__} already running — skipped")
+        return False
+    try:
+        await asyncio.to_thread(asyncio.run, job())
+        return True
+    finally:
+        lock.release()
+
+async def job_all_data():          return await _run_in_thread(refresh_all_data)
+async def job_analytics():         return await _run_in_thread(refresh_analytics_cache)
+async def job_claims():            return await _run_in_thread(refresh_claims_cache)
+async def job_network_faucets():   return await _run_in_thread(refresh_network_faucets)
+async def job_quiz_ecosystem():    return await _run_in_thread(refresh_quiz_ecosystem_cache)
 
 async def run_full_index():
     """Runs every indexer job once, one after another."""
