@@ -176,6 +176,7 @@ class DashboardResponse(BaseModel):
     total_unique_users: int
     total_faucets: int
     total_transactions: int
+    total_returning_users: int = 0
     claims_pie_data: List[Dict]
     faucet_rankings: List[Dict]
     users_chart: List[Dict]
@@ -249,19 +250,6 @@ CHAIN_CONFIGS: Dict[int, Dict] = {
         "nativeCurrency": {"symbol": "BOT", "decimals": 18},
         "blockExplorer": "https://scan.botchain.ai",
     },
-    11142220: {
-        "name": "Testnet",
-        "rpcUrls": [
-            "https://forno.celo-sepolia.celo-testnet.org",
-            "https://celo-sepolia.g.alchemy.com/v2/sXHCrL5-xwYkPtkRC_WTEZHvIkOVTbw-",
-            "https://celo-sepolia.infura.io/v3/e9fa8c3350054dafa40019a5b604679f",
-        ],
-        "factoryAddresses": ["0x69a12ecB86A9510c70CEB72d209A7d8b034ca5fE"],
-        "Quests": [""],
-        "quiz":   [""],
-        "nativeCurrency": {"symbol": "ETH", "decimals": 18},
-        "blockExplorer": "https://celo-sepolia.blockscout.com/",
-    }
 }
 
 CHAIN_CONFIGS_V2: Dict[int, Dict] = {
@@ -323,24 +311,16 @@ CHAIN_CONFIGS_V2: Dict[int, Dict] = {
             "0x4B8c7A12660C4847c65662a953F517198fBFc0ED": "custom",
         },
     },
-    11142220: {
-        "name": "Testnet",
-        "rpcUrls": CHAIN_CONFIGS[11142220]["rpcUrls"],
-        "factories": {
-            "0x69a12ecB86A9510c70CEB72d209A7d8b034ca5fE": "dropcode",
-        },
-    },
 }
 
-# Chain IDs included in analytics & tx counting — testnet excluded
-ANALYTICS_CHAIN_IDS: set = {42220, 1135, 42161, 8453, 56, 677}
+# Chain IDs included in analytics & tx counting (mainnets only)
+ANALYTICS_CHAIN_IDS: set = set(CHAIN_CONFIGS.keys())
 
 NATIVE_SYMBOLS: Dict[int, str] = {
     42220: "CELO",
     1135:  "ETH",
     42161: "ETH",
     8453:  "ETH",
-    11142220: "CELO",
     56:    "BNB",
     677: "BOT"
 }
@@ -432,6 +412,7 @@ dashboard_data: Dict[str, Any] = {
     "total_unique_users": 0,
     "total_faucets": 0,
     "total_transactions": 0,
+    "total_returning_users": 0,
     "claims_pie_data": [],
     "faucet_rankings": [],
     "users_chart": [],
@@ -711,7 +692,7 @@ async def _enrich_with_metadata(rows: List[Dict]) -> List[Dict]:
 
 # ====================== SUPABASE SAVE HELPER ======================
 
-def save_dashboard_to_supabase(data: Dict[str, Any]) -> None:
+def save_dashboard_to_supabase(data: Dict[str, Any], deleted_addrs: Optional[set] = None) -> None:
     if not supabase:
         return
 
@@ -739,6 +720,7 @@ def save_dashboard_to_supabase(data: Dict[str, Any]) -> None:
             {
                 "date":             item["date"],
                 "new_users":        item["newUsers"],
+                "returning_users":  item.get("returningUsers", 0),
                 "cumulative_users": item["cumulativeUsers"],
             }
             for item in data["users_chart"]
@@ -787,6 +769,7 @@ def save_dashboard_to_supabase(data: Dict[str, Any]) -> None:
                 "total_unique_users": data["total_unique_users"],
                 "total_faucets":      data["total_faucets"],
                 "total_transactions": data["total_transactions"],
+                "total_returning_users": data.get("total_returning_users", 0),
                 "last_updated":       now_iso,
             },
             on_conflict="id",
@@ -795,8 +778,10 @@ def save_dashboard_to_supabase(data: Dict[str, Any]) -> None:
         print(f"✅ [save_dashboard_to_supabase] all tables updated at {now_iso}")
 
         # ── 6. Evict deleted faucets from claim_data ────────────────────────
+        # (deleted set is passed in — calling run_until_complete inside a
+        #  running loop raised "event loop is already running" every time)
         try:
-            deleted_addrs = asyncio.get_event_loop().run_until_complete(fetch_deleted_faucets())
+            deleted_addrs = deleted_addrs or set()
             for addr in deleted_addrs:
                 supabase.table("claim_data").delete().eq("faucet_address", addr).execute()
             if deleted_addrs:
@@ -1144,7 +1129,6 @@ async def collect_quest_quiz_unique_participants() -> set:
         participants: set = set()
 
         for chain_id, cfg in CHAIN_CONFIGS.items():
-            # ── Skip testnet from participant counting ──
             if chain_id not in ANALYTICS_CHAIN_IDS:
                 continue
 
@@ -1271,7 +1255,6 @@ async def refresh_network_faucets():
     Crawls every chain → every typed factory → every faucet.
     Checks BOTH on-chain deleted flag AND deleted-faucets list before saving.
     Cleans up stale deleted rows from both network_faucets and faucet_details.
-    refresh_network_faucets intentionally includes testnet so faucet data is still crawled.
     """
     print(f"🔄 [refresh_network_faucets] started at {datetime.utcnow()}")
 
@@ -1774,12 +1757,50 @@ async def refresh_all_data():
     for date_str in first_claim_per_user.values():
         new_users_by_date[date_str] += 1
 
+    # ── Daily activity → returning users ──────────────────────────────────
+    # A returning user on day D = active on D AND first seen before D.
+    # Activity = faucet claims + quiz-ecosystem events + quest/quiz joins.
+    if not quiz_ecosystem_cache["transactions"]:
+        await refresh_quiz_ecosystem_cache()
+
+    active_by_date: Dict[str, set] = defaultdict(set)
+    for tx in all_claims:
+        d = datetime.fromtimestamp(int(tx[5])).strftime("%Y-%m-%d")
+        active_by_date[d].add(str(tx[2]).lower())
+    for tx in quiz_ecosystem_cache["transactions"]:
+        if not tx.get("time"):
+            continue
+        d = datetime.fromtimestamp(int(tx["time"])).strftime("%Y-%m-%d")
+        for u in tx["users"]:
+            active_by_date[d].add(u)
+    for addr, d in quest_quiz_dates.items():
+        active_by_date[d].add(addr)
+
+    returning_by_date: Dict[str, int] = defaultdict(int)
+    active_days_per_user: Dict[str, int] = defaultdict(int)
+    for d, users in active_by_date.items():
+        for u in users:
+            first = first_claim_per_user.get(u)
+            if not first:
+                continue  # only count users we also count as "new"
+            active_days_per_user[u] += 1
+            if first < d:
+                returning_by_date[d] += 1
+
+    total_returning_users = sum(1 for n in active_days_per_user.values() if n >= 2)
+    print(f"   🔁 Returning users (active on 2+ days): {total_returning_users}")
+
     users_chart = []
     cumulative  = 0
-    for date_str in sorted(new_users_by_date.keys()):
-        new = new_users_by_date[date_str]
+    for date_str in sorted(set(new_users_by_date) | set(returning_by_date)):
+        new = new_users_by_date.get(date_str, 0)
         cumulative += new
-        users_chart.append({"date": date_str, "newUsers": new, "cumulativeUsers": cumulative})
+        users_chart.append({
+            "date":            date_str,
+            "newUsers":        new,
+            "returningUsers":  returning_by_date.get(date_str, 0),
+            "cumulativeUsers": cumulative,
+        })
 
     total_claims   = len(all_claims)
     sorted_faucets = sorted(faucet_stats.items(), key=lambda x: x[1]["latest"], reverse=True)
@@ -1818,6 +1839,7 @@ async def refresh_all_data():
         "total_unique_users":   len(unique_users),
         "total_faucets":        sum(x["faucets"] for x in network_faucets_list),
         "total_transactions":   all_txs_count,
+        "total_returning_users": total_returning_users,
         "claims_pie_data":      pie,
         "faucet_rankings":      rankings,
         "users_chart":          users_chart,
@@ -1827,7 +1849,7 @@ async def refresh_all_data():
     }
     print(f"✅ Done: {total_claims} claims | {len(unique_users)} unique users | "
           f"{dashboard_data['total_faucets']} faucets | {all_txs_count} txs")
-    save_dashboard_to_supabase(dashboard_data)
+    save_dashboard_to_supabase(dashboard_data, deleted)
 
 # --- Endpoints ---
 @app.post("/api/spinners")
@@ -1999,7 +2021,15 @@ def load_from_supabase() -> Optional[dict]:
     total_faucets   = meta.get("total_faucets") or sum(r["faucets"] for r in network_faucets)
 
     user_rows = supabase.table("user_data").select("*").order("date", desc=False).execute().data or []
-    users_chart        = [{"date": r["date"], "newUsers": r["new_users"], "cumulativeUsers": r["cumulative_users"]} for r in user_rows]
+    users_chart        = [
+        {
+            "date":            r["date"],
+            "newUsers":        r["new_users"],
+            "returningUsers":  r.get("returning_users") or 0,
+            "cumulativeUsers": r["cumulative_users"],
+        }
+        for r in user_rows
+    ]
     total_unique_users = meta.get("total_unique_users") or (user_rows[-1]["cumulative_users"] if user_rows else 0)
 
     claim_rows = supabase.table("claim_data").select("*").order("latest_claim_time", desc=True).execute().data or []
@@ -2076,6 +2106,7 @@ def load_from_supabase() -> Optional[dict]:
         "total_unique_users":   total_unique_users,
         "total_faucets":        total_faucets,
         "total_transactions":   total_transactions,
+        "total_returning_users": meta.get("total_returning_users") or 0,
         "claims_pie_data":      pie,
         "faucet_rankings":      faucet_rankings,
         "users_chart":          users_chart,
@@ -2095,7 +2126,7 @@ async def build_faucet_analytics() -> dict:
         meta_rows = supabase.table("dashboard_meta").select("*").eq("id", 1).execute().data
         meta = meta_rows[0] if meta_rows else {}
 
-        # Faucet rows from network_faucets — filter out deleted AND testnet
+        # Faucet rows from network_faucets — filter out deleted
         all_faucet_rows = supabase.table("network_faucets").select("*").execute().data or []
         faucet_rows = [
             f for f in all_faucet_rows
@@ -2110,7 +2141,7 @@ async def build_faucet_analytics() -> dict:
         avg_drop_per_user = round(total_drops / unique_users, 2) if unique_users else 0
 
         # Monthly volume: aggregate claim_data by month + factory_type
-        # Filter claim_data to exclude deleted faucets and testnet
+        # Filter claim_data to exclude deleted faucets
         claim_rows_raw = supabase.table("claim_data").select("*").execute().data or []
         claim_rows = [
             r for r in claim_rows_raw
@@ -2165,7 +2196,7 @@ async def build_faucet_analytics() -> dict:
             {"name": "Custom",   "value": round(type_counts["custom"]   / total_typed * 100)},
         ]
 
-        # Top networks by claims (excluding deleted and testnet)
+        # Top networks by claims (excluding deleted)
         net_claims: dict = {}
         for row in claim_rows:
             net = row.get("network", "Unknown")
@@ -2659,9 +2690,7 @@ async def refresh_network_endpoint(chain_id: int, background_tasks: BackgroundTa
 @app.get("/api/refresh")
 async def manual_refresh():
     print("🖱️  [manual_refresh] triggered by frontend")
-    await asyncio.gather(
-        refresh_all_data(),
-    )
+    await job_all_data()
     return {
         "status":       "complete",
         "last_updated": dashboard_data.get("last_updated"),
@@ -2670,25 +2699,25 @@ async def manual_refresh():
 @app.get("/api/refresh/dashboard")
 async def refresh_dashboard():
     """Refresh all dashboard data (faucet page button)."""
-    await refresh_all_data()
+    await job_all_data()
     return {"status": "complete", "last_updated": dashboard_data.get("last_updated")}
 
 @app.get("/api/refresh/network-faucets")
 async def refresh_network_faucets_endpoint():
     """Refresh all network faucets (network page button)."""
-    await refresh_network_faucets()
+    await job_network_faucets()
     return {"status": "complete"}
 
 @app.get("/api/refresh/analytics")
 async def refresh_analytics_endpoint():
     """Refresh analytics cache (home page button)."""
-    await refresh_analytics_cache()
+    await job_analytics()
     return {"status": "complete", "last_updated": _analytics_cache.get("last_updated")}
 
 @app.get("/api/refresh/claims")
 async def refresh_claims_endpoint():
     """Refresh claims cache (faucet list page button)."""
-    await refresh_claims_cache()
+    await job_claims()
     return {
         "status": "complete",
         "last_updated": claims_last_updated.isoformat() if claims_last_updated else None,
@@ -2712,7 +2741,7 @@ async def sync_single_faucet(faucet_address: str, chain_id: Optional[int] = Quer
 
     for cid, cfg in chains_to_try:
         try:
-            w3 = get_web3_for_chain(cfg["rpcUrls"], chain_id)
+            w3 = get_web3_for_chain(cfg["rpcUrls"], cid)
         except:
             continue
 
@@ -3240,7 +3269,7 @@ claims_last_updated: Optional[datetime] = None
 async def refresh_claims_cache():
     """
     Fetches all claims across all networks and enriches them with
-    Supabase metadata. Filters out deleted faucets and testnet.
+    Supabase metadata. Filters out deleted faucets.
     Includes Botchain claimS() events from custom faucets via event logs.
     """
     global global_claims_cache, claims_last_updated
@@ -3401,6 +3430,46 @@ async def get_all_claims(
         "last_updated": claims_last_updated.isoformat() if claims_last_updated else None,
         "claims": global_claims_cache[:limit]
     }
+
+@app.get("/api/users/returning")
+async def get_returning_users(days: int = Query(30, ge=1, le=3650)):
+    """
+    Returning (recurring) users: users active on a day after the day they were
+    first seen. Activity = faucet claims, quiz-ecosystem events, quest/quiz joins.
+    """
+    data = dashboard_data
+    if supabase:
+        try:
+            data = load_from_supabase() or dashboard_data
+        except Exception as e:
+            print(f"⚠️  [returning users] Supabase read failed: {e}")
+
+    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    series = [
+        {
+            "date":           r["date"],
+            "returningUsers": r.get("returningUsers", 0),
+            "newUsers":       r.get("newUsers", 0),
+        }
+        for r in data.get("users_chart", [])
+        if str(r["date"]) >= since
+    ]
+
+    total_unique   = data.get("total_unique_users", 0)
+    total_returning = data.get("total_returning_users", 0)
+    period_returning = sum(r["returningUsers"] for r in series)
+
+    return {
+        "success":               True,
+        "period_days":           days,
+        "total_unique_users":    total_unique,
+        "total_returning_users": total_returning,   # users active on 2+ different days
+        "returning_rate":        round(total_returning / total_unique * 100, 1) if total_unique else 0,
+        "period_returning_visits": period_returning,  # sum of daily returning users in the period
+        "daily":                 series,
+        "last_updated":          data.get("last_updated"),
+    }
+
 
 @app.get("/api/quiz-ecosystem/users")
 async def get_quiz_ecosystem_users(
@@ -3586,14 +3655,29 @@ async def like_blog_post(slug: str, fingerprint: str):
 
 
 # ====================== SCHEDULER ======================
+# The jobs make blocking web3 calls. Running them in a worker thread (with its
+# own event loop) keeps the API responsive while indexing.
 
+async def _run_in_thread(job):
+    await asyncio.to_thread(asyncio.run, job())
+
+async def job_all_data():          await _run_in_thread(refresh_all_data)
+async def job_analytics():         await _run_in_thread(refresh_analytics_cache)
+async def job_claims():            await _run_in_thread(refresh_claims_cache)
+async def job_network_faucets():   await _run_in_thread(refresh_network_faucets)
+async def job_quiz_ecosystem():    await _run_in_thread(refresh_quiz_ecosystem_cache)
+
+async def run_full_index():
+    """Runs every indexer job once, one after another."""
+    for job in (job_network_faucets, job_quiz_ecosystem, job_all_data, job_claims, job_analytics):
+        try:
+            await job()
+        except Exception as e:
+            print(f"⚠️  [run_full_index] {job.__name__} failed: {e}")
+
+# Created here, started in the startup hook (must be on uvicorn's running loop)
 scheduler = AsyncIOScheduler()
-scheduler.add_job(refresh_all_data,        "interval", hours=3)
-scheduler.add_job(refresh_analytics_cache, "interval", hours=3)
-scheduler.add_job(refresh_claims_cache,    "interval", hours=3)
-scheduler.add_job(refresh_network_faucets, "interval", hours=3)
-scheduler.add_job(refresh_quiz_ecosystem_cache, "interval", hours=3)
-scheduler.start()
+scheduler.add_job(run_full_index, "interval", hours=3, max_instances=1, coalesce=True)
 
 
 # ====================== STARTUP ======================
@@ -3611,11 +3695,14 @@ async def startup():
                 print("✅ [Startup] Loaded initial data from Supabase")
         except Exception as e:
             print(f"⚠️ [Startup] Supabase cache empty or failed: {e}")
-        # asyncio.create_task(refresh_quiz_ecosystem_cache())  # ← add this one
-        # asyncio.create_task(refresh_all_data())
-        # asyncio.create_task(refresh_network_faucets())
-        # asyncio.create_task(refresh_analytics_cache())
-        # asyncio.create_task(refresh_claims_cache())
+
+    if not scheduler.running:
+        scheduler.start()
+        print("⏰ [Startup] Scheduler started (full index every 3h)")
+
+    # Index once on boot — on Render free tier the service sleeps after
+    # ~15 min idle, so a 3h-interval job alone would never fire.
+    asyncio.create_task(run_full_index())
 
 # ====================== RENDER.COM COMPATIBLE RUN ======================
 if __name__ == "__main__":
