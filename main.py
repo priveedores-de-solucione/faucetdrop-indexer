@@ -1891,6 +1891,15 @@ async def refresh_all_data():
         f"{'─'*60}"
     )
 
+    # ── Quiz hub users (DROP token / QuizHub / RedeemPool events) ─────────
+    if not quiz_ecosystem_cache["transactions"]:
+        await refresh_quiz_ecosystem_cache()
+    quiz_hub_users = set(quiz_ecosystem_cache["users"])
+    net_new_qh     = quiz_hub_users - unique_users
+    unique_users.update(quiz_hub_users)
+    print(f"  👥 Quiz hub users: {len(quiz_hub_users)} "
+          f"(+{len(net_new_qh)} net new) → TOTAL unique users: {len(unique_users)}")
+
     print(f"🔤 Fetching names for {len(faucet_stats)} faucets...")
     for addr_lower, stats in faucet_stats.items():
         stats["name"] = get_faucet_name_sync(stats["w3"], stats["addr_checksum"])
@@ -1914,6 +1923,19 @@ async def refresh_all_data():
             first_claim_per_user[addr] = date_str
             merged_qq += 1
     print(f"   📅 Merged {merged_qq} quest/quiz-only dated users into users_chart")
+
+    # ── Merge quiz hub dates (first on-chain event per user) ──────────────
+    merged_qh = 0
+    for tx in quiz_ecosystem_cache["transactions"]:
+        if not tx.get("time"):
+            continue
+        date_str = datetime.fromtimestamp(int(tx["time"])).strftime("%Y-%m-%d")
+        for u in tx["users"]:
+            if u not in first_claim_per_user:
+                merged_qh += 1
+            if u not in first_claim_per_user or date_str < first_claim_per_user[u]:
+                first_claim_per_user[u] = date_str
+    print(f"   📅 Merged {merged_qh} quiz-hub-only dated users into users_chart")
 
     new_users_by_date = defaultdict(int)
     for date_str in first_claim_per_user.values():
